@@ -1,0 +1,11 @@
+# never commit credentials or exported tenant data
+.env
+*.xlsx
+raw/
+wiz_raw*/
+*.json
+!package.json
+__pycache__/
+*.pyc
+.venv/
+venv/
