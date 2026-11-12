@@ -15,6 +15,11 @@ generated, and writes a triage workbook with two review levels:
   * Issues           - one row per Issue (all, or a per-control sample) with the
                        entity, project, status, age, ticket, deep links and blank
                        triage columns for the true/false-positive verdict.
+  * Analysis         - where the fix belongs, by Issue volume: share of open Issues
+                       carried by config rules acting as controls, graph controls
+                       built on CCR findings, other finding types, and control-level
+                       logic; concentration (top 10/20/50); top controls; an audit of
+                       every entity type seen in control queries.
   * Control Inputs   - one row per (control, input entity type) so you can pivot
                        on which underlying finding types drive the Issue volume.
   * Summary / README / Lists - run evidence (filters, totalCounts, pruned
@@ -35,8 +40,9 @@ Authentication (OAuth2 client credentials, secrets only via environment):
 
 Usage:
   python3 wiz_graph_control_triage.py --dry-run -v          # connectivity, schema, counts only
-  python3 wiz_graph_control_triage.py                       # full export -> Wiz_Graph_Control_Triage_<date>.xlsx
-  python3 wiz_graph_control_triage.py --history-days 180 --sample-per-control 25 -o spg_gc_triage.xlsx
+  python3 wiz_graph_control_triage.py                       # full export + analysis -> Wiz_Graph_Control_Triage_<date>.xlsx
+  python3 wiz_graph_control_triage.py --org "S&P" -o spg_gc_triage.xlsx
+  python3 wiz_graph_control_triage.py --exclude-config-controls   # graph (toxic combination) controls only, as in v1.0.0
   python3 wiz_graph_control_triage.py --statuses OPEN,IN_PROGRESS --severity CRITICAL,HIGH --project <projectId>
 
 Exit codes: 0 success, 2 partial (an optional data source was unavailable), 1 fatal.
@@ -63,8 +69,12 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("ERROR: the 'requests' package is required. Install with: pip install requests\n")
     sys.exit(1)
 
-VERSION = "1.0.0"
-# 1.0.0 (2026-11-09): initial release. Mock-tested only - first live run with --dry-run -v.
+VERSION = "1.1.0"
+# 1.0.0 (2026-11-09): initial release.
+# 1.1.0 (2026-11-12): after the first live run (DC us25). Config rules acting as controls and their
+#   CLOUD_CONFIGURATION Issues are pulled by default; every control gets a Fix Location; new Analysis sheet
+#   (share of open Issues by fix location and input class, concentration, top controls, entity-type audit);
+#   history window default 180 days; headline numbers printed at the end of the run.
 USER_AGENT = "wiz-graph-control-triage/%s" % VERSION
 DEFAULT_AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 DEFAULT_APP_URL = "https://app.wiz.io"
@@ -583,12 +593,20 @@ FINDING_TYPES = {
     "SECURITY_EVENT": "Security event / detection",
     "SECURITY_TOOL_FINDING": "Third-party security tool finding",
     "SECURITY_TOOL_SCAN": "Third-party security scan",
-    "NETWORK_EXPOSURE": "Network exposure path",
-    "ENDPOINT": "Network endpoint",
     "SOFTWARE_SUPPLY_CHAIN_FINDING": "Supply chain finding",
     "SAST_FINDING": "SAST finding",
     "SENSITIVE_DATA_FINDING": "Sensitive data finding",
 }
+
+EXPOSURE_TYPES = {"NETWORK_EXPOSURE": "Network exposure path (Wiz network analysis)", "ENDPOINT": "Network endpoint"}
+CCR_TYPES = ("CONFIGURATION_FINDING", "CONFIGURATION_RULE")
+
+FIX_RULE_SINGLE = "Rule level: config rule acting as a control"
+FIX_RULE_CCR = "Rule level: graph control built on CCR findings"
+FIX_FINDING_OTHER = "Finding level: other finding types (vulnerability, secret, data, malware)"
+FIX_CONTROL = "Control level: exposure, permissions or properties only"
+FIX_UNKNOWN = "Unknown: query not available"
+FIX_ORDER = [FIX_RULE_SINGLE, FIX_RULE_CCR, FIX_FINDING_OTHER, FIX_CONTROL, FIX_UNKNOWN]
 
 EXPOSURE_KEY_RE = re.compile(
     r"expos|internetfacing|publicexposure|publiclyaccessible|opentoallinternet|hasPublicIp|externallyfacing|"
@@ -625,7 +643,17 @@ class QueryAnalysis(object):
 
     @property
     def uses_ccr(self):
-        return any(t in ("CONFIGURATION_FINDING", "CONFIGURATION_RULE") for t in self.all_types)
+        return any(t in CCR_TYPES for t in self.all_types)
+
+    @property
+    def other_finding_types(self):
+        return [t for t in self.finding_inputs if t not in CCR_TYPES]
+
+    @property
+    def has_other_findings(self):
+        """Non-CCR finding inputs: by entity type, or by a property that encodes one (e.g. a vulnerability flag)."""
+        return bool(self.other_finding_types or self.uses_vuln or self.uses_sensitive_data
+                    or self.uses_secrets or self.uses_malware)
 
     @property
     def uses_vuln(self):
@@ -896,6 +924,24 @@ def bi_scope(node):
     return ", ".join(parts) if parts else "None (all BI levels off)"
 
 
+def is_config_control(ctrl):
+    """A Cloud Configuration Rule functioning as a control (one rule, no correlation)."""
+    return bool(ctrl.get("type") == "CLOUD_CONFIGURATION" or ctrl.get("sourceCloudConfigurationRule"))
+
+
+def fix_location(ctrl, analysis):
+    """Exclusive bucket: where a false positive from this control would be corrected."""
+    if is_config_control(ctrl):
+        return FIX_RULE_SINGLE
+    if analysis.parse_error and not analysis.all_types:
+        return FIX_UNKNOWN
+    if analysis.uses_ccr:
+        return FIX_RULE_CCR
+    if analysis.has_other_findings:
+        return FIX_FINDING_OTHER
+    return FIX_CONTROL
+
+
 def pct(part, whole):
     return round(100.0 * part / whole, 1) if whole else None
 
@@ -926,6 +972,7 @@ def pull_controls(client, explorer, args, evidence):
         if "issueAnalytics" in explorer.type_fields(node_t):
             sel_type = "ControlIssueAnalyticsSelection"
             in_fields = explorer.input_fields(sel_type)
+            evidence["issueAnalytics_input_fields"] = ", ".join(sorted(in_fields.keys())) or "(none returned)"
             selection = {}
             if in_fields:
                 # Prefer an "open issues" selection when the input type exposes a status filter.
@@ -946,41 +993,54 @@ def pull_controls(client, explorer, args, evidence):
 
 
 def pull_issues(client, explorer, args, as_of, evidence):
-    """Open/in-progress Issues (statuses from --statuses) plus RESOLVED/REJECTED Issues whose status changed
-    in the last --history-days. Returns (issues, by_scope_totals)."""
+    """Per Issue type: open/in-progress Issues (--statuses) plus RESOLVED/REJECTED Issues whose status changed
+    in the last --history-days. Each (type, scope) is a separate pull so every totalCount is reproducible."""
     pruned = []
     spec = json.loads(json.dumps(ISSUE_SPEC), object_pairs_hook=OrderedDict)  # deep copy; pruning mutates it
-    base_filter = {"type": args.issue_types}
-    if args.severity:
-        base_filter["severity"] = args.severity
-    if args.project:
-        base_filter["project"] = args.project
     order = {"field": "CREATED_AT", "direction": "ASC"}
-    scopes = []
-    if args.statuses:
-        f = dict(base_filter)
-        f["status"] = args.statuses
-        scopes.append(("current", f))
-    if args.history_days and args.history_days > 0:
-        cutoff = as_of - timedelta(days=args.history_days)
-        f = dict(base_filter)
-        f["status"] = ["RESOLVED", "REJECTED"]
-        f["statusChangedAt"] = {"after": iso_z(cutoff)}
-        scopes.append(("history", f))
     issues, seen = [], set()
     totals = OrderedDict()
-    for label, flt in scopes:
-        nodes, total, meta = paged_fetch(client, "issuesV2", spec, args.page_size, "issues:%s" % label, pruned,
-                                         filter_by=flt, filter_type="IssueFilters",
-                                         order_by=order, order_type="IssueOrder")
-        totals[label] = {"filter": flt, "totalCount": total, "fetched": len(nodes), "pages": meta["pages"]}
-        for n in nodes:
-            if n.get("id") in seen:
-                continue
-            seen.add(n.get("id"))
-            n["_scope"] = label
-            issues.append(n)
-    evidence["issues"] = {"scopes": totals, "unique": len(issues), "pruned": pruned}
+    failed = []
+    for itype in args.issue_types:
+        base_filter = {"type": [itype]}
+        if args.severity:
+            base_filter["severity"] = args.severity
+        if args.project:
+            base_filter["project"] = args.project
+        scopes = []
+        if args.statuses:
+            f = dict(base_filter)
+            f["status"] = args.statuses
+            scopes.append(("current", f))
+        if args.history_days and args.history_days > 0:
+            cutoff = as_of - timedelta(days=args.history_days)
+            f = dict(base_filter)
+            f["status"] = ["RESOLVED", "REJECTED"]
+            f["statusChangedAt"] = {"after": iso_z(cutoff)}
+            scopes.append(("history", f))
+        for label, flt in scopes:
+            key = "%s %s" % (label, itype)
+            try:
+                nodes, total, meta = paged_fetch(client, "issuesV2", spec, args.page_size, "issues:%s" % key, pruned,
+                                                 filter_by=flt, filter_type="IssueFilters",
+                                                 order_by=order, order_type="IssueOrder")
+            except WizPermissionError:
+                raise
+            except WizAPIError as exc:
+                if itype == "TOXIC_COMBINATION" or len(args.issue_types) == 1:
+                    raise
+                log.warning("[issues:%s] pull failed, continuing without this Issue type: %s", key, str(exc)[:200])
+                totals[key] = {"filter": flt, "totalCount": None, "fetched": 0, "pages": 0, "error": str(exc)[:200]}
+                failed.append(key)
+                break
+            totals[key] = {"filter": flt, "totalCount": total, "fetched": len(nodes), "pages": meta["pages"]}
+            for n in nodes:
+                if n.get("id") in seen:
+                    continue
+                seen.add(n.get("id"))
+                n["_scope"] = label
+                issues.append(n)
+    evidence["issues"] = {"scopes": totals, "unique": len(issues), "pruned": pruned, "failed": failed}
     return issues
 
 
@@ -1013,8 +1073,8 @@ def pull_ccrs(client, explorer, args, evidence, wanted_ids):
 OPEN_STATUSES = ("OPEN", "IN_PROGRESS")
 
 
-def control_id_of_issue(issue):
-    """Issue -> (control id, control name) from sourceRules (Control, or CCR functioning as control)."""
+def control_id_of_issue(issue, ccr_to_control=None):
+    """Issue -> (control id, control name) from sourceRules (Control, or a config rule functioning as a control)."""
     for r in issue.get("sourceRules") or []:
         if not isinstance(r, dict):
             continue
@@ -1025,6 +1085,8 @@ def control_id_of_issue(issue):
             c = r.get("control") or {}
             if c.get("id"):
                 return c["id"], c.get("name") or r.get("name")
+            if r.get("id") and ccr_to_control and r["id"] in ccr_to_control:
+                return ccr_to_control[r["id"]]
             if r.get("id"):
                 return "ccr:" + r["id"], r.get("name")
         if tn == "CloudEventRule" and r.get("id"):
@@ -1057,8 +1119,13 @@ def aggregate(controls, issues, as_of, args):
             if isinstance(p, dict) and p.get("id"):
                 project_issue_counts[p["id"]] += 1
     cutoff_90 = as_of - timedelta(days=90)
+    ccr_to_control = {}
+    for c in controls:
+        src = c.get("sourceCloudConfigurationRule")
+        if isinstance(src, dict) and src.get("id"):
+            ccr_to_control[src["id"]] = (c["id"], c.get("name"))
     for iss in issues:
-        cid, cname = control_id_of_issue(iss)
+        cid, cname = control_id_of_issue(iss, ccr_to_control)
         if not cid:
             cid, cname = "unknown", "(no source rule returned)"
         iss["_control_id"] = cid
@@ -1136,11 +1203,24 @@ def control_row(ctrl, agg, analysis, ccr_map, args, as_of):
             ccr_refs.append(rid)
     ccr_refs.extend(sorted(analysis.rule_short_ids))
     ia = ctrl.get("issueAnalytics") or {}
+    is_cfg = is_config_control(ctrl)
+    src = ctrl.get("sourceCloudConfigurationRule") if isinstance(ctrl.get("sourceCloudConfigurationRule"), dict) else {}
+    if is_cfg and not ccr_refs and src:
+        ccr_refs = [("%s %s" % (src.get("shortId") or "", src.get("name") or "")).strip()]
+    if is_cfg:
+        control_class = "Config rule as control"
+        lever = ("One Cloud Configuration Rule functioning as a control, no correlation: tune or scope the rule itself "
+                 "(Ignore Rule on its findings, clone/patch the CCR), or turn off Function as Control to stop the Issues "
+                 "and keep the findings")
+    else:
+        control_class = "Unknown (control not returned)" if ctrl.get("_synthetic") else "Graph control"
+        lever = analysis.tuning_lever() if not (analysis.parse_error and not analysis.all_types) else "Query not available: review in the console"
     row = OrderedDict([
         ("Control ID", ctrl.get("id")),
         ("Control Name", ctrl.get("name")),
         ("Origin", origin_of(ctrl)),
         ("Control Type", ctrl.get("type")),
+        ("Control Class", control_class),
         ("Enabled", ctrl.get("enabled")),
         ("Severity", ctrl.get("severity")),
         ("Business Impact Scope", bi_scope(ctrl)),
@@ -1163,8 +1243,8 @@ def control_row(ctrl, agg, analysis, ccr_map, args, as_of):
         ("Root Entity Type(s)", ", ".join(analysis.root_types)),
         ("All Entity Types in Query", ", ".join(analysis.all_types.keys())),
         ("Finding-Type Inputs", ", ".join(analysis.finding_inputs)),
-        ("Input Classes", ", ".join(analysis.input_classes())),
-        ("Built on CCR Findings?", "Yes" if analysis.uses_ccr else "No"),
+        ("Input Classes", "CCR finding (single rule)" if is_cfg else ", ".join(analysis.input_classes())),
+        ("Built on CCR Findings?", "Yes (single config rule)" if is_cfg else ("Yes" if analysis.uses_ccr else "No")),
         ("Referenced CCRs", "; ".join(ccr_refs)),
         ("Exposure Condition?", "Yes" if analysis.uses_exposure else "No"),
         ("Permission/CIEM Condition?", "Yes" if analysis.uses_permissions else "No"),
@@ -1176,8 +1256,9 @@ def control_row(ctrl, agg, analysis, ccr_map, args, as_of):
         ("Relationship Types", ", ".join("%s" % k for k, _ in analysis.relationships.most_common(10))),
         ("Where Keys", ", ".join(sorted(analysis.where_keys)[:25])),
         ("Query Depth", analysis.depth),
-        ("Query Parse Note", analysis.parse_error or ""),
-        ("Where a False Positive Gets Fixed", analysis.tuning_lever()),
+        ("Query Parse Note", "" if (is_cfg and not analysis.all_types) else (analysis.parse_error or "")),
+        ("Fix Location", fix_location(ctrl, analysis)),
+        ("Where a False Positive Gets Fixed", lever),
         # -- issue statistics
         ("Open Issues", agg["open"] if agg else 0),
         ("In Progress Issues", agg["in_progress"] if agg else 0),
@@ -1337,10 +1418,145 @@ def select_issue_rows(per, args):
 
 
 # --------------------------------------------------------------------------- #
+# Analysis: where does the fix belong, measured by Issue volume
+# --------------------------------------------------------------------------- #
+
+ANALYSIS_HEADERS = ["Group", "Controls", "Enabled", "Controls With Open Issues", "Open + In Progress Issues",
+                    "% of Open Issues", "Open Critical + High", "Resolved (window)", "Rejected (window)",
+                    "Reject Rate %", "Rejected as FALSE_POSITIVE"]
+
+
+def build_analysis(selected, per, analyses):
+    recs = []
+    for c in selected:
+        a = analyses[c["id"]]
+        agg = per.get(c["id"])
+        recs.append({
+            "id": c["id"], "name": c.get("name") or c["id"], "cfg": is_config_control(c),
+            "synthetic": bool(c.get("_synthetic")), "enabled": bool(c.get("enabled")),
+            "severity": c.get("severity") or "", "fix": fix_location(c, a), "a": a,
+            "open": (agg["open"] + agg["in_progress"]) if agg else 0,
+            "crit_high": (agg["sev"].get("CRITICAL", 0) + agg["sev"].get("HIGH", 0)) if agg else 0,
+            "resolved": agg["resolved"] if agg else 0,
+            "rejected": agg["rejected"] if agg else 0,
+            "fp": agg["fp_rejected"] if agg else 0,
+        })
+    total_open = sum(r["open"] for r in recs)
+
+    def stat(label, subset):
+        o = sum(r["open"] for r in subset)
+        res = sum(r["resolved"] for r in subset)
+        rej = sum(r["rejected"] for r in subset)
+        return [label, len(subset), sum(1 for r in subset if r["enabled"]), sum(1 for r in subset if r["open"] > 0),
+                o, pct(o, total_open), sum(r["crit_high"] for r in subset), res, rej, pct(rej, res + rej),
+                sum(r["fp"] for r in subset)]
+
+    by_fix = OrderedDict((name, [r for r in recs if r["fix"] == name]) for name in FIX_ORDER)
+    buckets = [stat(name, subset) for name, subset in by_fix.items() if subset or name != FIX_UNKNOWN]
+    buckets.append(stat("All controls in workbook", recs))
+    rule_level = by_fix[FIX_RULE_SINGLE] + by_fix[FIX_RULE_CCR]
+    any_finding = rule_level + by_fix[FIX_FINDING_OTHER]
+    def mixed(r):
+        return (not r["cfg"]) and (r["a"].uses_exposure or r["a"].uses_permissions)
+    finding_only = [r for r in any_finding if not mixed(r)]
+    finding_mixed = [r for r in any_finding if mixed(r)]
+    rollups = [
+        stat("Rule level combined (config-rule controls + graph controls built on CCR findings)", rule_level),
+        stat("Any finding input (rule level + other finding types)", any_finding),
+        stat("  of which: finding or rule is the only input (the fix is at the finding or rule)", finding_only),
+        stat("  of which: finding combined with an exposure or permission condition (either side can be wrong)", finding_mixed),
+        stat("Control level only (no finding input)", by_fix[FIX_CONTROL]),
+    ]
+    graph = [r for r in recs if not r["cfg"] and not r["synthetic"]]
+    class_defs = [
+        ("Graph controls built on CCR findings", lambda r: r["a"].uses_ccr),
+        ("Graph controls with a vulnerability condition", lambda r: r["a"].uses_vuln),
+        ("Graph controls with a secrets condition", lambda r: r["a"].uses_secrets),
+        ("Graph controls with a sensitive-data condition", lambda r: r["a"].uses_sensitive_data),
+        ("Graph controls with a malware condition", lambda r: r["a"].uses_malware),
+        ("Graph controls with any finding-type input", lambda r: r["a"].uses_ccr or r["a"].has_other_findings),
+        ("Graph controls with an exposure condition", lambda r: r["a"].uses_exposure),
+        ("Graph controls with a permission / CIEM condition", lambda r: r["a"].uses_permissions),
+        ("Graph controls with a tag condition", lambda r: r["a"].uses_tags),
+        ("Graph controls with exposure or permissions and no finding input", lambda r: r["fix"] == FIX_CONTROL and (r["a"].uses_exposure or r["a"].uses_permissions)),
+    ]
+    classes = [stat(label, [r for r in graph if fn(r)]) for label, fn in class_defs]
+    classes.append(stat("All graph controls", graph))
+    classes.append(stat("Config rules acting as controls", [r for r in recs if r["cfg"]]))
+
+    ranked = sorted(recs, key=lambda r: (-r["open"], r["name"]))
+    with_open = [r for r in ranked if r["open"] > 0]
+    concentration = []
+    for n in (10, 20, 50, 100):
+        top = sum(r["open"] for r in ranked[:n])
+        concentration.append(["Top %d controls" % n, top, pct(top, total_open)])
+    for target in (50, 80, 90):
+        run, needed = 0, 0
+        for r in with_open:
+            run += r["open"]
+            needed += 1
+            if total_open and 100.0 * run / total_open >= target:
+                break
+        concentration.append(["Controls needed to reach %d%% of open Issues" % target, needed if total_open else 0, None])
+    concentration.append(["Controls with at least one open Issue", len(with_open), pct(len(with_open), len(recs))])
+    concentration.append(["Controls with no open Issue", len(recs) - len(with_open), pct(len(recs) - len(with_open), len(recs))])
+
+    top_rows, cum = [], 0
+    for i, r in enumerate(with_open[:25], 1):
+        cum += r["open"]
+        closed = r["resolved"] + r["rejected"]
+        top_rows.append([i, r["name"], "Config rule as control" if r["cfg"] else ("Unknown" if r["synthetic"] else "Graph control"),
+                         r["fix"], r["severity"], r["open"], pct(r["open"], total_open), pct(cum, total_open),
+                         pct(r["rejected"], closed), r["fp"]])
+
+    types = {}
+    for r in graph:
+        for t in r["a"].all_types:
+            e = types.setdefault(t, {"controls": 0, "with_open": 0, "open": 0})
+            e["controls"] += 1
+            e["with_open"] += 1 if r["open"] > 0 else 0
+            e["open"] += r["open"]
+    type_rows = []
+    for t, e in sorted(types.items(), key=lambda kv: (-kv[1]["open"], -kv[1]["controls"], kv[0])):
+        if t in CCR_TYPES:
+            treated = "CCR finding (rule level)"
+        elif t in FINDING_TYPES or t.endswith("_FINDING"):
+            treated = "Other finding type"
+        elif t in EXPOSURE_TYPES:
+            treated = "Exposure analysis"
+        else:
+            treated = "Resource / identity / other (not a finding)"
+        type_rows.append([t, treated, e["controls"], e["with_open"], e["open"]])
+
+    def share(rows, label_prefix):
+        for row in rows:
+            if row[0].startswith(label_prefix):
+                return row
+        return None
+
+    b = dict((row[0], row) for row in buckets)
+    def line(name):
+        row = b.get(name)
+        return "%s open (%s%%) from %s controls" % (row[4], row[5] if row[5] is not None else 0, row[1]) if row else "0"
+    headlines = [
+        "Open + in-progress Issues in workbook: %d across %d controls (%d controls have at least one)" % (total_open, len(recs), len(with_open)),
+        "Config rules acting as controls: %s" % line(FIX_RULE_SINGLE),
+        "Graph controls built on CCR findings: %s" % line(FIX_RULE_CCR),
+        "Graph controls on other finding types: %s" % line(FIX_FINDING_OTHER),
+        "Control level only: %s" % line(FIX_CONTROL),
+        "Rule level combined: %s%% of open Issues. Any finding input: %s%%. Control level only: %s%%." % (rollups[0][5], rollups[1][5], rollups[4][5]),
+        "Range for 'the fix is at the finding': %s%% (finding or rule is the only input) to %s%% (any finding input, including controls that also depend on exposure or permissions)." % (rollups[2][5], rollups[1][5]),
+        "Concentration: top 10 controls = %s%%, top 20 = %s%%. %s controls reach 80%%." % (concentration[0][2], concentration[1][2], concentration[5][1]),
+    ]
+    return {"total_open": total_open, "buckets": buckets, "rollups": rollups, "classes": classes,
+            "concentration": concentration, "top": top_rows, "types": type_rows, "headlines": headlines}
+
+
+# --------------------------------------------------------------------------- #
 # Workbook
 # --------------------------------------------------------------------------- #
 
-def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, run_info, list_counts):
+def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, run_info, list_counts, analysis):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
@@ -1386,6 +1602,8 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
         ("1. Controls Review is the applicability decision, one row per Graph Control. Dark-blue columns are Wiz metadata, brown columns describe what the control's graph query correlates (parsed from Control.query), green columns are Issue statistics for the pull window, and gold columns are yours to fill.", False),
         ("2. Issues is the evidence. Each row is one Issue the control produced (all of them, or a per-control sample when --sample-per-control was used). Record the true/false-positive verdict per Issue, then roll the counts up into the control row (Sample Reviewed, True Positives, False Positives).", False),
         ("3. Control Inputs lists every entity type each control's query touches. Filter it on CONFIGURATION_FINDING to see which controls are built on Cloud Configuration Rule findings: a false positive there is fixed at the CCR, not at the control.", False),
+        ("Analysis answers the scoping question with volume instead of control counts: how many open Issues come from config rules acting as controls, from graph controls built on CCR findings, from other finding types, and from control-level logic (exposure, permissions, properties). The Fix Location column on Controls Review is the same classification per control. It is derived from the control's query by entity type and property name, so check the Entity Types table at the bottom of Analysis before quoting a percentage.", False),
+        ("Config rules acting as controls (Control Class = Config rule as control, Issue Type = CLOUD_CONFIGURATION) are single Cloud Configuration Rules that generate Issues with no correlation. They are included by default. Use --exclude-config-controls for graph controls only.", False),
         ("4. Work the controls in order of Open + In Progress (descending). Controls with zero Issues in the window still get a row so applicability can be recorded, but they are not where the noise is.", False),
         ("", False),
         ("Reading the Issue statistics", True),
@@ -1553,20 +1771,25 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
         ("  of which built-in", list_counts.get("controls_builtin")),
         ("  of which custom", list_counts.get("controls_custom")),
         ("  with open/in-progress Issues", list_counts.get("controls_with_open")),
-        ("  built on CCR findings", list_counts.get("controls_ccr")),
-        ("  excluded (type CLOUD_CONFIGURATION, use --include-config-controls)", list_counts.get("controls_excluded_config")),
+        ("  graph controls built on CCR findings", list_counts.get("controls_ccr")),
+        ("  config rules acting as controls (type CLOUD_CONFIGURATION), included", list_counts.get("controls_config")),
+        ("  config rules acting as controls, excluded (--exclude-config-controls)", list_counts.get("controls_excluded_config")),
+        ("  placeholder rows (control referenced by Issues but not returned by the controls query)", list_counts.get("controls_synthetic")),
         ("Pruned Control fields (not in this tenant's schema)", ", ".join((evidence.get("controls") or {}).get("pruned") or []) or "none"),
         ("Control selection used", (evidence.get("controls") or {}).get("selection")),
         ("issueAnalytics selection", evidence.get("issueAnalytics_selection", "n/a")),
+        ("ControlIssueAnalyticsSelection input fields", evidence.get("issueAnalytics_input_fields", "n/a")),
         ("", ""),
         ("Issues", ""),
     ]
     for label, sc in ((evidence.get("issues") or {}).get("scopes") or {}).items():
         rows.append(("issuesV2 filter [%s]" % label, json.dumps(sc["filter"])))
-        rows.append(("  totalCount (API) / fetched / pages", "%s / %s / %s" % (sc["totalCount"], sc["fetched"], sc["pages"])))
+        rows.append(("  totalCount (API) / fetched / pages", "%s / %s / %s%s" % (sc["totalCount"], sc["fetched"], sc["pages"],
+                                                                               ("  ERROR: " + sc["error"]) if sc.get("error") else "")))
     rows += [
         ("Unique Issues pulled", (evidence.get("issues") or {}).get("unique")),
         ("Issue rows written (sampling: %s)" % ("all" if not args.sample_per_control else "%d per control" % args.sample_per_control), list_counts.get("issue_rows")),
+        ("Sampling note", evidence.get("auto_sample", "none")),
         ("Issues whose control is not in the controls pull", list_counts.get("orphan_issues")),
         ("Pruned Issue fields", ", ".join((evidence.get("issues") or {}).get("pruned") or []) or "none"),
         ("", ""),
@@ -1600,6 +1823,69 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
     wsu.column_dimensions["A"].width = 58
     wsu.column_dimensions["B"].width = 120
 
+    # ---- Analysis -------------------------------------------------------- #
+    wa = wb.create_sheet("Analysis", 2)
+    state = {"r": 1}
+
+    def a_title(text, size=12):
+        wa.cell(row=state["r"], column=1, value=text).font = Font(bold=True, size=size)
+        state["r"] += 1
+
+    def a_note(text):
+        c = wa.cell(row=state["r"], column=1, value=text.replace("[ORG]", args.org))
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        wa.merge_cells(start_row=state["r"], start_column=1, end_row=state["r"], end_column=11)
+        wa.row_dimensions[state["r"]].height = 15 * max(1, (len(text) // 150) + 1)
+        state["r"] += 1
+
+    def a_table(hdrs, data, bold_last=0):
+        for c, h in enumerate(hdrs, 1):
+            cell = wa.cell(row=state["r"], column=c, value=h)
+            cell.font = HEAD_FONT
+            cell.fill = HEAD_FILL
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+            cell.border = BORDER
+        wa.row_dimensions[state["r"]].height = 32
+        state["r"] += 1
+        for i, row in enumerate(data):
+            for c, v in enumerate(row, 1):
+                cell = wa.cell(row=state["r"], column=c, value=clean(v) if v is not None else "")
+                cell.border = BORDER
+                if bold_last and i >= len(data) - bold_last:
+                    cell.font = Font(bold=True)
+            state["r"] += 1
+        state["r"] += 1
+
+    a_title("Where the fix belongs, measured by Issue volume", 14)
+    a_note("Generated %s. Open = OPEN + IN_PROGRESS. Window = Issues resolved or rejected in the last %s days. Percentages are of the %d open Issues in this workbook." % (run_info["as_of"], args.history_days, analysis["total_open"]))
+    state["r"] += 1
+    a_title("Headlines")
+    for h in analysis["headlines"]:
+        a_note(h)
+    state["r"] += 1
+    a_title("1. Fix location (each control counted once)")
+    a_note("Rule level = a false positive is corrected at a Cloud Configuration Rule and the control inherits it. Finding level = the control keys on vulnerability, secret, data or malware findings handled under their own programme. Control level = the control correlates exposure, permissions or resource properties and can only be adjusted at the control (scope, Ignore Rule, clone and refine, disable).")
+    a_table(ANALYSIS_HEADERS, analysis["buckets"], bold_last=1)
+    a_title("2. Roll-ups")
+    a_note("The 'only input' row is the conservative figure for work that belongs at the finding or rule. The 'combined' row is toxic combinations in the full sense: a finding plus exposure or permissions, where a false positive can come from either side and the control still has to be judged.")
+    a_table(ANALYSIS_HEADERS, analysis["rollups"])
+    a_title("3. Input classes (a control can appear in several rows)")
+    a_table(ANALYSIS_HEADERS, analysis["classes"], bold_last=2)
+    a_title("4. Concentration of open Issues")
+    a_table(["Measure", "Value", "%"], analysis["concentration"])
+    a_title("5. Top 25 controls by open Issues")
+    a_table(["Rank", "Control", "Control Class", "Fix Location", "Severity", "Open + In Progress", "% of Open Issues",
+             "Cumulative %", "Reject Rate %", "Rejected as FALSE_POSITIVE"], analysis["top"])
+    a_title("6. Entity types seen in graph control queries (audit of the classification)")
+    a_note("Every entity type that appears in any graph control query, and how this script treats it. If a type listed as 'Resource / identity / other' is really a finding type in this tenant, the Fix Location of the controls using it is understated: report the type so it can be added.")
+    a_table(["Entity Type", "Treated As", "Controls Using It", "Of Which With Open Issues", "Open Issues of Those Controls"], analysis["types"])
+    wa.column_dimensions["A"].width = 78
+    wa.column_dimensions["B"].width = 44
+    wa.column_dimensions["C"].width = 24
+    wa.column_dimensions["D"].width = 52
+    for col in "EFGHIJK":
+        wa.column_dimensions[col].width = 18
+
     wb.save(path)
 
 
@@ -1619,11 +1905,13 @@ def parse_args(argv=None):
     p.add_argument("--dry-run", action="store_true", help="Authenticate, introspect, report totalCounts; write nothing")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--statuses", default="OPEN,IN_PROGRESS", help="Issue statuses for the current view (default OPEN,IN_PROGRESS)")
-    p.add_argument("--history-days", type=int, default=90, help="Also pull RESOLVED/REJECTED Issues whose status changed in the last N days (default 90; 0 = skip)")
-    p.add_argument("--issue-types", default="TOXIC_COMBINATION", help="issuesV2 type filter (default TOXIC_COMBINATION; add CLOUD_CONFIGURATION for CCRs functioning as controls)")
+    p.add_argument("--history-days", type=int, default=180, help="Also pull RESOLVED/REJECTED Issues whose status changed in the last N days (default 180; 0 = skip)")
+    p.add_argument("--issue-types", default="TOXIC_COMBINATION,CLOUD_CONFIGURATION", help="Issue types to pull, one pull per type (default TOXIC_COMBINATION,CLOUD_CONFIGURATION)")
     p.add_argument("--severity", default=None, help="Issue severity filter, e.g. CRITICAL,HIGH")
     p.add_argument("--project", default=None, help="Wiz project id(s) to restrict Issues to (comma-separated)")
-    p.add_argument("--include-config-controls", action="store_true", help="Include controls of type CLOUD_CONFIGURATION (config-rule-as-control duplicates)")
+    p.add_argument("--exclude-config-controls", action="store_true", help="Leave out config rules acting as controls (type CLOUD_CONFIGURATION) and their Issues")
+    p.add_argument("--include-config-controls", action="store_true", help=argparse.SUPPRESS)  # default since 1.1.0
+    p.add_argument("--max-issue-rows", type=int, default=300000, help="If more Issues than this are pulled and no --sample-per-control is set, write a 200-per-control sample (statistics still use every Issue)")
     p.add_argument("--enabled-only", action="store_true", help="Only controls that are enabled")
     p.add_argument("--with-issues-only", action="store_true", help="Only controls with at least one Issue in the pull window")
     p.add_argument("--sample-per-control", type=int, default=0, help="Write at most N Issues per control to the Issues sheet (0 = all)")
@@ -1640,6 +1928,8 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     args.statuses = csv_list(args.statuses)
     args.issue_types = csv_list(args.issue_types)
+    if args.exclude_config_controls:
+        args.issue_types = [t for t in args.issue_types if t != "CLOUD_CONFIGURATION"] or ["TOXIC_COMBINATION"]
     args.severity = csv_list(args.severity) if args.severity else None
     args.project = csv_list(args.project) if args.project else None
     return args
@@ -1677,16 +1967,27 @@ def main(argv=None):
             spec = OrderedDict([("id", None)])
             _, total_c, _ = paged_fetch(client, "controls", spec, 1, "controls(count)", pruned, filter_by={}, filter_type="ControlFilters", max_pages=1)
             log.info("controls totalCount = %s", total_c)
-            flt = {"type": args.issue_types, "status": args.statuses}
-            _, total_i, _ = paged_fetch(client, "issuesV2", OrderedDict([("id", None)]), 1, "issues(count)", pruned, filter_by=flt, filter_type="IssueFilters", max_pages=1)
-            log.info("issuesV2 %s totalCount = %s", json.dumps(flt), total_i)
-            if args.history_days:
-                flt2 = {"type": args.issue_types, "status": ["RESOLVED", "REJECTED"],
-                        "statusChangedAt": {"after": iso_z(as_of - timedelta(days=args.history_days))}}
-                _, total_h, _ = paged_fetch(client, "issuesV2", OrderedDict([("id", None)]), 1, "issues(history count)", pruned, filter_by=flt2, filter_type="IssueFilters", max_pages=1)
-                log.info("issuesV2 %s totalCount = %s", json.dumps(flt2), total_h)
-                est = ((total_i or 0) + (total_h or 0)) / float(args.page_size)
-                log.info("Estimated full run: ~%d issue pages + ~%d control pages", est + 1, ((total_c or 0) // args.page_size) + 1)
+            grand = 0
+            for itype in args.issue_types:
+                flts = [("current", {"type": [itype], "status": args.statuses})]
+                if args.history_days:
+                    flts.append(("history", {"type": [itype], "status": ["RESOLVED", "REJECTED"],
+                                             "statusChangedAt": {"after": iso_z(as_of - timedelta(days=args.history_days))}}))
+                for label, flt in flts:
+                    try:
+                        _, total_i, _ = paged_fetch(client, "issuesV2", OrderedDict([("id", None)]), 1, "issues(count %s %s)" % (label, itype),
+                                                    pruned, filter_by=flt, filter_type="IssueFilters", max_pages=1)
+                    except WizPermissionError:
+                        raise
+                    except WizAPIError as exc:
+                        log.warning("issuesV2 %s could not be counted: %s", json.dumps(flt), str(exc)[:200])
+                        continue
+                    grand += total_i or 0
+                    log.info("issuesV2 %s totalCount = %s", json.dumps(flt), total_i)
+            log.info("Estimated full run: %d Issues, ~%d issue pages + ~%d control pages", grand,
+                     (grand // args.page_size) + len(args.issue_types) * 2, ((total_c or 0) // args.page_size) + 1)
+            if grand > args.max_issue_rows:
+                log.info("More than --max-issue-rows (%d) Issues: the Issues sheet will be a 200-per-control sample unless you set --sample-per-control", args.max_issue_rows)
             if explorer.available:
                 node_t = explorer.node_type_of("controls")
                 have = explorer.type_fields(node_t) if node_t else {}
@@ -1698,6 +1999,8 @@ def main(argv=None):
 
         controls = pull_controls(client, explorer, args, evidence)
         issues = pull_issues(client, explorer, args, as_of, evidence)
+        if (evidence.get("issues") or {}).get("failed"):
+            exit_code = 2
 
         # -- analyse queries, collect CCR references
         analyses = {}
@@ -1720,7 +2023,7 @@ def main(argv=None):
         selected = []
         excluded_config = 0
         for c in controls:
-            if not args.include_config_controls and (c.get("type") == "CLOUD_CONFIGURATION" or c.get("sourceCloudConfigurationRule")):
+            if args.exclude_config_controls and is_config_control(c):
                 excluded_config += 1
                 continue
             if args.enabled_only and not c.get("enabled"):
@@ -1732,12 +2035,18 @@ def main(argv=None):
         for cid, agg in per.items():
             if cid in control_ids or cid == "unknown":
                 continue
-            if not args.include_config_controls and cid.startswith(("ccr:", "cer:")):
+            if args.exclude_config_controls and cid.startswith("ccr:"):
                 continue
             selected.append({"id": cid, "name": agg["name"] or cid, "type": "(not returned by controls query)",
                              "enabled": None, "severity": None, "createdBy": {}, "_synthetic": True})
             analyses[cid] = analyse_query(None)
 
+        pulled_total = sum(len(v["issues"]) for v in per.values())
+        if not args.sample_per_control and pulled_total > args.max_issue_rows:
+            args.sample_per_control = 200
+            evidence["auto_sample"] = ("%d Issues pulled exceeds --max-issue-rows %d: Issues sheet holds a 200-per-control sample. "
+                                       "All statistics use every Issue." % (pulled_total, args.max_issue_rows))
+            log.warning(evidence["auto_sample"])
         issue_rows_src = select_issue_rows(per, args)
         control_rows = []
         for c in selected:
@@ -1752,6 +2061,17 @@ def main(argv=None):
             a = analyses[c["id"]]
             agg = per.get(c["id"])
             ccr_refs = "; ".join(((ccr_map.get(r) or {}).get("shortId") or r) for r in sorted(a.rule_ids))
+            if is_config_control(c) and not a.all_types:
+                src = c.get("sourceCloudConfigurationRule") if isinstance(c.get("sourceCloudConfigurationRule"), dict) else {}
+                input_rows.append(OrderedDict([
+                    ("Control ID", c["id"]), ("Control Name", c.get("name")), ("Enabled", c.get("enabled")),
+                    ("Severity", c.get("severity")),
+                    ("Open + In Progress", (agg["open"] + agg["in_progress"]) if agg else 0),
+                    ("Entity Type", "CONFIGURATION_FINDING"), ("Role", "Config rule as control (single rule)"),
+                    ("Finding Type?", "Yes"), ("Finding Description", FINDING_TYPES["CONFIGURATION_FINDING"]),
+                    ("Negated?", False), ("Optional?", False), ("Where Keys on This Type", ""),
+                    ("Referenced CCRs", ("%s %s" % (src.get("shortId") or "", src.get("name") or "")).strip()),
+                ]))
             for t, info in a.all_types.items():
                 input_rows.append(OrderedDict([
                     ("Control ID", c["id"]), ("Control Name", c.get("name")), ("Enabled", c.get("enabled")),
@@ -1776,6 +2096,8 @@ def main(argv=None):
             "controls_with_open": sum(1 for r in control_rows if (r["Open + In Progress"] or 0) > 0),
             "controls_ccr": sum(1 for r in control_rows if r["Built on CCR Findings?"] == "Yes"),
             "controls_excluded_config": excluded_config,
+            "controls_config": sum(1 for c in selected if is_config_control(c)),
+            "controls_synthetic": sum(1 for c in selected if c.get("_synthetic")),
             "issue_rows": len(issue_rows),
             "orphan_issues": orphan,
         }
@@ -1783,8 +2105,12 @@ def main(argv=None):
                     "sa_name": client.token_claims.get("name"), "requests": client.requests_made,
                     "duration": round(time.time() - started, 1)}
         out = args.output or "Wiz_Graph_Control_Triage_%s.xlsx" % as_of.strftime("%Y-%m-%d")
-        write_workbook(out, control_rows, issue_rows, input_rows, evidence, args, run_info, list_counts)
+        analysis = build_analysis(selected, per, analyses)
+        write_workbook(out, control_rows, issue_rows, input_rows, evidence, args, run_info, list_counts, analysis)
         log.info("Workbook written: %s (%d control rows, %d issue rows, %d input rows)", out, len(control_rows), len(issue_rows), len(input_rows))
+        log.info("---- Headlines (also on the Analysis sheet) ----")
+        for h in analysis["headlines"]:
+            log.info("  %s", h)
 
         if args.raw_dir:
             os.makedirs(args.raw_dir, exist_ok=True)
@@ -1793,7 +2119,8 @@ def main(argv=None):
             with open(os.path.join(args.raw_dir, "issues.json"), "w") as fh:
                 json.dump([{k: v for k, v in i.items() if not k.startswith("_")} for i in issues], fh, indent=1, default=str)
             with open(os.path.join(args.raw_dir, "evidence.json"), "w") as fh:
-                json.dump({"evidence": evidence, "run": run_info, "counts": list_counts}, fh, indent=1, default=str)
+                json.dump({"evidence": evidence, "run": run_info, "counts": list_counts,
+                           "analysis": {k: v for k, v in analysis.items()}}, fh, indent=1, default=str)
             log.info("Raw JSON written to %s", args.raw_dir)
         if orphan:
             log.warning("%d Issues reference a control that the controls query did not return (synthetic rows added)", orphan)
