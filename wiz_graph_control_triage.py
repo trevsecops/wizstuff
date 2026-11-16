@@ -69,12 +69,17 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("ERROR: the 'requests' package is required. Install with: pip install requests\n")
     sys.exit(1)
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 # 1.0.0 (2026-11-09): initial release.
 # 1.1.0 (2026-11-12): after the first live run (DC us25). Config rules acting as controls and their
 #   CLOUD_CONFIGURATION Issues are pulled by default; every control gets a Fix Location; new Analysis sheet
 #   (share of open Issues by fix location and input class, concentration, top controls, entity-type audit);
 #   history window default 180 days; headline numbers printed at the end of the run.
+# 1.2.0 (2026-11-13): INFORMATIONAL Issues are left out by default (--min-severity LOW) from every pull,
+#   statistic and table; the number left out is counted and recorded on Summary and Analysis.
+# 1.3.0 (2026-11-16): triage cards. A self-contained <output>_cards.html with one single-screen card per
+#   control that has open Issues (logic rendered from the query, statistics, distributions, sampled Issues,
+#   per-Issue detail). Identifiers are masked by default so a card can be screenshotted for review.
 USER_AGENT = "wiz-graph-control-triage/%s" % VERSION
 DEFAULT_AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 DEFAULT_APP_URL = "https://app.wiz.io"
@@ -992,6 +997,39 @@ def pull_controls(client, explorer, args, evidence):
     return nodes
 
 
+SEVERITY_ORDER = ["INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+
+def issue_base_filter(args, itype):
+    f = {"type": [itype]}
+    if args.severity:
+        f["severity"] = args.severity
+    if args.project:
+        f["project"] = args.project
+    return f
+
+
+def count_excluded(client, args):
+    """How many open Issues the severity floor leaves out, per Issue type (count-only queries)."""
+    out = OrderedDict()
+    if not getattr(args, "excluded_severities", None) or not args.statuses:
+        return out
+    for itype in args.issue_types:
+        flt = {"type": [itype], "status": args.statuses, "severity": args.excluded_severities}
+        if args.project:
+            flt["project"] = args.project
+        try:
+            _, total, _ = paged_fetch(client, "issuesV2", OrderedDict([("id", None)]), 1, "issues(left out %s)" % itype, [],
+                                      filter_by=flt, filter_type="IssueFilters", max_pages=1)
+        except WizPermissionError:
+            raise
+        except WizAPIError as exc:
+            log.warning("Could not count %s Issues left out by the severity floor: %s", itype, str(exc)[:160])
+            total = None
+        out[itype] = {"filter": flt, "totalCount": total}
+    return out
+
+
 def pull_issues(client, explorer, args, as_of, evidence):
     """Per Issue type: open/in-progress Issues (--statuses) plus RESOLVED/REJECTED Issues whose status changed
     in the last --history-days. Each (type, scope) is a separate pull so every totalCount is reproducible."""
@@ -1002,11 +1040,7 @@ def pull_issues(client, explorer, args, as_of, evidence):
     totals = OrderedDict()
     failed = []
     for itype in args.issue_types:
-        base_filter = {"type": [itype]}
-        if args.severity:
-            base_filter["severity"] = args.severity
-        if args.project:
-            base_filter["project"] = args.project
+        base_filter = issue_base_filter(args, itype)
         scopes = []
         if args.statuses:
             f = dict(base_filter)
@@ -1040,7 +1074,8 @@ def pull_issues(client, explorer, args, as_of, evidence):
                 seen.add(n.get("id"))
                 n["_scope"] = label
                 issues.append(n)
-    evidence["issues"] = {"scopes": totals, "unique": len(issues), "pruned": pruned, "failed": failed}
+    evidence["issues"] = {"scopes": totals, "unique": len(issues), "pruned": pruned, "failed": failed,
+                          "excluded": count_excluded(client, args)}
     return issues
 
 
@@ -1787,6 +1822,8 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
         rows.append(("  totalCount (API) / fetched / pages", "%s / %s / %s%s" % (sc["totalCount"], sc["fetched"], sc["pages"],
                                                                                ("  ERROR: " + sc["error"]) if sc.get("error") else "")))
     rows += [
+        ("Severity scope", args.severity_scope),
+        ("Open Issues left out by the severity scope", "; ".join("%s: %s" % (t, e["totalCount"]) for t, e in ((evidence.get("issues") or {}).get("excluded") or {}).items()) or "none"),
         ("Unique Issues pulled", (evidence.get("issues") or {}).get("unique")),
         ("Issue rows written (sampling: %s)" % ("all" if not args.sample_per_control else "%d per control" % args.sample_per_control), list_counts.get("issue_rows")),
         ("Sampling note", evidence.get("auto_sample", "none")),
@@ -1857,7 +1894,7 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
         state["r"] += 1
 
     a_title("Where the fix belongs, measured by Issue volume", 14)
-    a_note("Generated %s. Open = OPEN + IN_PROGRESS. Window = Issues resolved or rejected in the last %s days. Percentages are of the %d open Issues in this workbook." % (run_info["as_of"], args.history_days, analysis["total_open"]))
+    a_note("Generated %s. Open = OPEN + IN_PROGRESS. Severity scope: %s. Window = Issues resolved or rejected in the last %s days. Percentages are of the %d open Issues in this workbook." % (run_info["as_of"], args.severity_scope, args.history_days, analysis["total_open"]))
     state["r"] += 1
     a_title("Headlines")
     for h in analysis["headlines"]:
@@ -1890,6 +1927,449 @@ def write_workbook(path, control_rows, issue_rows, input_rows, evidence, args, r
 
 
 # --------------------------------------------------------------------------- #
+# Triage cards: one screen per control, built to be photographed or screenshotted
+# --------------------------------------------------------------------------- #
+
+UUID_ANY_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+ARN_RE = re.compile(r"arn:[a-z0-9\-]*:[^\s,;\"']+")
+IP_RE = re.compile(r"(?<!\d)\d{1,3}(?:\.\d{1,3}){3}(?!\d)")
+HEX_RUN_RE = re.compile(r"(?<![A-Za-z0-9])(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}(?![A-Za-z0-9])")
+DIGIT_RUN_RE = re.compile(r"\d{5,}")
+
+FIX_SHORT = {FIX_RULE_SINGLE: "RULE (single config rule)", FIX_RULE_CCR: "RULE (graph control on CCR finding)",
+             FIX_FINDING_OTHER: "FINDING (vuln / secret / data)", FIX_CONTROL: "CONTROL (no finding input)",
+             FIX_UNKNOWN: "UNKNOWN"}
+QUERY_OPS = {"EQUALS": "=", "NOT_EQUALS": "!=", "IN": "in", "NOT_IN": "not in", "CONTAINS": "contains",
+             "NOT_CONTAINS": "!contains", "GREATER_THAN": ">", "LESS_THAN": "<", "GREATER_THAN_OR_EQUAL": ">=",
+             "LESS_THAN_OR_EQUAL": "<=", "STARTS_WITH": "starts", "ENDS_WITH": "ends", "IS_SET": "is set",
+             "CONTAINS_ANY": "has any", "CONTAINS_ALL": "has all", "BEFORE": "before", "AFTER": "after"}
+
+
+def mask_text(value, enabled=True, limit=60):
+    """Remove identifiers that are not needed to judge a control: account ids, ARNs, IPs, emails, UUIDs,
+    long numeric or hex runs. Words in names are kept because they carry the meaning (eks-node, prod, bastion)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    s = ILLEGAL_XLSX_RE.sub("", str(value))
+    if enabled:
+        s = EMAIL_RE.sub("<email>", s)
+        s = ARN_RE.sub("<arn>", s)
+        s = UUID_ANY_RE.sub("<uuid>", s)
+        s = IP_RE.sub("<ip>", s)
+        s = HEX_RUN_RE.sub("#", s)
+        s = DIGIT_RUN_RE.sub("#", s)
+    if limit and len(s) > limit:
+        s = s[: limit - 1] + "…"
+    return s
+
+
+def tags_of(ent):
+    t = (ent or {}).get("tags")
+    if isinstance(t, str):
+        try:
+            t = json.loads(t)
+        except ValueError:
+            return []
+    if isinstance(t, dict):
+        return [(str(k), v) for k, v in t.items()]
+    out = []
+    if isinstance(t, list):
+        for x in t:
+            if isinstance(x, dict):
+                k = x.get("key") or x.get("name")
+                if k is not None:
+                    out.append((str(k), x.get("value")))
+            elif isinstance(x, str):
+                out.append((x, ""))
+    return out
+
+
+def _q_val(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        if len(v) == 1:
+            return _q_val(v[0])
+        shown = ", ".join(_q_val(x) for x in v[:6])
+        return "[%s%s]" % (shown, ", +%d" % (len(v) - 6) if len(v) > 6 else "")
+    if isinstance(v, dict):
+        if "key" in v and "value" in v and len(v) <= 3:
+            return "%s=%s" % (v.get("key"), v.get("value"))
+        return json.dumps(v, separators=(",", ":"))[:70]
+    return str(v)[:70]
+
+
+def _q_where(where, prefix=""):
+    parts = []
+    if not isinstance(where, dict):
+        return ""
+    for k, v in where.items():
+        if k in ("AND", "OR") and isinstance(v, list):
+            inner = [w for w in (_q_where(x, prefix) for x in v) if w]
+            if inner:
+                parts.append("(" + (" %s " % k).join(inner) + ")")
+        elif k == "NOT":
+            inner = _q_where(v, prefix) if isinstance(v, dict) else ""
+            if inner:
+                parts.append("NOT(" + inner + ")")
+        elif isinstance(v, dict) and v and all(isinstance(op, str) and op.upper() == op for op in v):
+            for op, val in v.items():
+                if op == "IS_SET":
+                    parts.append("%s%s %s" % (prefix, k, "is set" if val else "not set"))
+                else:
+                    parts.append("%s%s %s %s" % (prefix, k, QUERY_OPS.get(op, op.lower()), _q_val(val)))
+        elif isinstance(v, dict):
+            inner = _q_where(v, prefix + k + ".")
+            if inner:
+                parts.append(inner)
+        else:
+            parts.append("%s%s=%s" % (prefix, k, _q_val(v)))
+    return ", ".join(parts)
+
+
+def render_query(raw, mask=True):
+    """Control.query JSON -> indented plain-text lines, one per graph node."""
+    q = raw
+    if isinstance(raw, str):
+        try:
+            q = json.loads(raw)
+        except ValueError:
+            return ["(query is not JSON)"]
+    if not q:
+        return []
+    lines = []
+
+    def walk(node, depth, prefix):
+        if not isinstance(node, dict) or len(lines) > 200:
+            return
+        types = node.get("type") or ["?"]
+        if isinstance(types, str):
+            types = [types]
+        line = "  " * depth + prefix + "|".join(str(t) for t in types)
+        w = _q_where(node.get("where") or {})
+        if w:
+            line += "  where " + w
+        lines.append(mask_text(line, mask, 260))
+        for rel in node.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            rts = rel.get("type") or []
+            if isinstance(rts, dict):
+                rts = [rts]
+            names = "|".join(str(t.get("type") if isinstance(t, dict) else t) for t in rts) or "?"
+            rev = any(isinstance(t, dict) and t.get("reverse") for t in rts)
+            arrow = ("<-%s- " if rev else "-%s-> ") % names
+            pre = ("NOT " if rel.get("negate") else "") + ("OPTIONAL " if rel.get("optional") else "") + arrow
+            walk(rel.get("with") or {}, depth + 1, pre)
+
+    try:
+        for item in (q if isinstance(q, list) else [q]):
+            walk(item, 0, "")
+    except Exception as exc:  # noqa: BLE001
+        lines.append("(query walk failed: %s)" % exc)
+    return lines
+
+
+def _top(counter, n, total=None):
+    out = []
+    for k, v in counter.most_common(n):
+        out.append([str(k), v, pct(v, total) if total else None])
+    return out
+
+
+def _bi_of(iss):
+    """Business impact of the Issue's most specific project (umbrella projects would otherwise mask it)."""
+    order = ["HBI", "MBI", "LBI"]
+    prim = iss.get("_primary_project")
+    for p in iss.get("projects") or []:
+        if isinstance(p, dict) and prim and p.get("name") == prim:
+            v = (p.get("riskProfile") or {}).get("businessImpact")
+            if v:
+                return v
+    vals = {((p.get("riskProfile") or {}).get("businessImpact") or "") for p in (iss.get("projects") or []) if isinstance(p, dict)}
+    vals.discard("")
+    for o in order:
+        if o in vals:
+            return o
+    return sorted(vals)[0] if vals else "none"
+
+
+def _sample_issue(iss, acct_alias, mask):
+    ent = iss.get("entitySnapshot") or {}
+    tags = tags_of(ent)
+    return {
+        "id": (iss.get("id") or "")[-8:],
+        "sev": iss.get("severity") or "", "status": iss.get("status") or "", "reason": iss.get("resolutionReason") or "",
+        "age": iss.get("_age_days"), "created": (iss.get("createdAt") or "")[:10], "changed": (iss.get("statusChangedAt") or "")[:10],
+        "due": (iss.get("dueAt") or "")[:10], "pastdue": bool(iss.get("_past_due")),
+        "name": mask_text(ent.get("name"), mask, 46), "etype": ent.get("type") or "", "ntype": ent.get("nativeType") or "",
+        "estatus": ent.get("status") or "", "ecreated": (ent.get("createdAt") or "")[:10],
+        "cloud": ent.get("cloudPlatform") or "", "region": ent.get("region") or "",
+        "acct": acct_alias.get(ent.get("subscriptionExternalId"), "") if mask else (ent.get("subscriptionExternalId") or ""),
+        "sub": mask_text(ent.get("subscriptionName"), mask, 36),
+        "project": iss.get("_primary_project") or "", "projects": join_names(iss.get("projects"), cap=8), "bi": _bi_of(iss),
+        "tags": [[mask_text(k, mask, 28), mask_text(v, mask, 30)] for k, v in tags[:24]], "ntags": len(tags),
+        "tickets": len(iss.get("serviceTickets") or []),
+    }
+
+
+def pick_samples(agg, n_open=6, n_closed=2):
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFORMATIONAL": 4}
+    open_iss = [i for i in agg["issues"] if i.get("status") in OPEN_STATUSES]
+    open_iss.sort(key=lambda i: (sev_rank.get(i.get("severity"), 9), -(i.get("_age_days") or 0)))
+    buckets = OrderedDict()
+    for i in open_iss:
+        buckets.setdefault(i.get("_primary_project") or "", []).append(i)
+    chosen = []
+    while len(chosen) < n_open and any(buckets.values()):
+        for k in list(buckets.keys()):
+            if buckets[k] and len(chosen) < n_open:
+                chosen.append(buckets[k].pop(0))
+    rejected = [i for i in agg["issues"] if i.get("status") == "REJECTED"]
+    rejected.sort(key=lambda i: (0 if i.get("resolutionReason") == "FALSE_POSITIVE" else 1, i.get("statusChangedAt") or ""), reverse=False)
+    closed = rejected[:n_closed]
+    if len(closed) < n_closed:
+        fixed = [i for i in agg["issues"] if i.get("status") == "RESOLVED" and i.get("resolutionReason") == "ISSUE_FIXED"]
+        closed += fixed[: n_closed - len(closed)]
+    return chosen + closed
+
+
+def build_cards(control_rows, selected, per, analyses, args, run_info):
+    by_id = dict((c["id"], c) for c in selected)
+    mask = not args.cards_unmasked
+    acct_counts = Counter()
+    for agg in per.values():
+        for iss in agg["issues"]:
+            sid = (iss.get("entitySnapshot") or {}).get("subscriptionExternalId")
+            if sid:
+                acct_counts[sid] += 1
+    acct_alias = dict((sid, "acct-%02d" % (n + 1)) for n, (sid, _) in enumerate(acct_counts.most_common()))
+    cards = []
+    for idx, row in enumerate(control_rows):
+        cid = row["Control ID"]
+        open_n = row["Open + In Progress"] or 0
+        if open_n <= 0 and not args.cards_all:
+            continue
+        if args.cards_top and len(cards) >= args.cards_top:
+            break
+        ctrl = by_id.get(cid) or {}
+        agg = per.get(cid)
+        a = analyses.get(cid)
+        is_cfg = is_config_control(ctrl)
+        logic = render_query(ctrl.get("query"), mask)
+        if is_cfg:
+            logic = ["Single config rule acting as a control. No correlation: every resource that fails the rule gets an Issue."] + logic
+        if not logic:
+            logic = ["(no query returned for this control)"]
+        open_iss = [i for i in (agg["issues"] if agg else []) if i.get("status") in OPEN_STATUSES]
+        n = len(open_iss)
+        ntypes, regions, bis, estat, tagkeys, tagkv, ages, subs = Counter(), Counter(), Counter(), Counter(), Counter(), Counter(), Counter(), Counter()
+        untagged = 0
+        for iss in open_iss:
+            ent = iss.get("entitySnapshot") or {}
+            ntypes[ent.get("nativeType") or ent.get("type") or "?"] += 1
+            regions[ent.get("region") or "?"] += 1
+            bis[_bi_of(iss)] += 1
+            estat[ent.get("status") or "?"] += 1
+            sid = ent.get("subscriptionExternalId")
+            if sid:
+                subs[(acct_alias.get(sid, "?") if mask else sid) + " " + mask_text(ent.get("subscriptionName"), mask, 26)] += 1
+            tags = tags_of(ent)
+            if not tags:
+                untagged += 1
+            for k, v in tags:
+                tagkeys[mask_text(k, mask, 30)] += 1
+                mv = mask_text(v, mask, 22)
+                if mv and mv not in ("#", "<email>", "<uuid>", "<arn>", "<ip>"):
+                    tagkv["%s=%s" % (mask_text(k, mask, 24), mv)] += 1
+            age = iss.get("_age_days") or 0
+            ages["<7d" if age < 7 else "7-30d" if age < 30 else "30-90d" if age < 90 else "90-365d" if age < 365 else ">365d"] += 1
+        src = ctrl.get("sourceCloudConfigurationRule") if isinstance(ctrl.get("sourceCloudConfigurationRule"), dict) else {}
+        cards.append({
+            "n": len(cards) + 1, "row": idx + 2, "cid": cid if len(cid) <= 14 else "…" + cid[-10:],
+            "name": row.get("Control Name") or "", "cls": row.get("Control Class") or "", "sev": row.get("Severity") or "",
+            "enabled": clean(row.get("Enabled")), "origin": row.get("Origin") or "", "bi": row.get("Business Impact Scope") or "",
+            "pscope": clean(row.get("Project Scope")), "fix": row.get("Fix Location") or "", "fixs": FIX_SHORT.get(row.get("Fix Location"), row.get("Fix Location") or ""),
+            "inputs": row.get("Input Classes") or "", "refs": mask_text(row.get("Referenced CCRs"), mask, 300),
+            "srcrule": ("%s %s" % (src.get("shortId") or "", src.get("name") or "")).strip(),
+            "desc": mask_text(ctrl.get("description"), mask, 700), "reco": mask_text(ctrl.get("resolutionRecommendation"), mask, 500),
+            "frameworks": (row.get("Frameworks") or "")[:160],
+            "flags": {"exposure": bool(a and a.uses_exposure), "perms": bool(a and a.uses_permissions), "vuln": bool(a and a.uses_vuln),
+                      "data": bool(a and a.uses_sensitive_data), "tags": bool(a and a.uses_tags), "ccr": bool(a and a.uses_ccr) or is_cfg},
+            "logic": logic,
+            "stats": {
+                "open": row.get("Open Issues") or 0, "inprog": row.get("In Progress Issues") or 0,
+                "crit": row.get("Open Critical") or 0, "high": row.get("Open High") or 0, "med": row.get("Open Medium") or 0,
+                "low": row.get("Open Low/Info") or 0, "entities": row.get("Unique Open Entities") or 0,
+                "oldest": row.get("Oldest Open (days)"), "median": row.get("Median Open Age (days)"),
+                "pastdue": row.get("Open Past Due") or 0, "ticketpct": row.get("Open With Ticket %"),
+                "new90": row.get("Created Last 90d") or 0, "resolved": row.get("Resolved (window)") or 0,
+                "rejected": row.get("Rejected (window)") or 0, "rejrate": row.get("Reject Rate % (rejected / closed)"),
+                "fp": row.get("Rejected as FALSE_POSITIVE") or 0, "objdel": row.get("OBJECT_DELETED % of Resolved"),
+                "mttr": row.get("Median Days-to-Resolve"), "subs": row.get("Subscriptions (open)") or 0,
+                "resmix": row.get("Resolution Reason Mix") or "", "rejmix": row.get("Rejection Reason Mix") or "",
+            },
+            "dist": {
+                "projects": _top(agg["projects"], 6, n) if agg else [], "ntypes": _top(ntypes, 5, n), "regions": _top(regions, 5, n),
+                "bi": _top(bis, 4, n), "estatus": _top(estat, 3, n), "ages": [[k, ages.get(k, 0), pct(ages.get(k, 0), n)] for k in ("<7d", "7-30d", "30-90d", "90-365d", ">365d")],
+                "clouds": _top(agg["clouds"], 4, n) if agg else [], "accounts": _top(subs, 4, n),
+                "tagkeys": _top(tagkeys, 10, n), "tagkv": _top(tagkv, 8, n), "untagged": untagged, "untaggedpct": pct(untagged, n),
+            },
+            "samples": [_sample_issue(i, acct_alias, mask) for i in (pick_samples(agg) if agg else [])],
+        })
+    meta = {"generated": run_info["as_of"], "version": VERSION, "org": args.org, "scope": args.severity_scope,
+            "history_days": args.history_days, "masked": mask, "cards": len(cards),
+            "selection": "all controls" if args.cards_all else "controls with open Issues"}
+    return {"meta": meta, "cards": cards}
+
+
+CARDS_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Wiz control triage cards</title>
+<style>
+:root{--fs:15px;--bg:#0b0f14;--fg:#eef3f8;--mut:#9db0c4;--line:#2c3a4a;--acc:#7cc4ff;--warn:#ffb454;--bad:#ff7b7b;--ok:#7bd88f;--panel:#111a25}
+body.light{--bg:#ffffff;--fg:#0c0f12;--mut:#4b5a69;--line:#b9c2cc;--acc:#0b5cad;--warn:#8a5200;--bad:#b00020;--ok:#1b6e2d;--panel:#f2f5f8}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:var(--fs)/1.27 Consolas,"Cascadia Mono","SF Mono",Menlo,"DejaVu Sans Mono",monospace}
+#app{max-width:1560px;margin:0 auto;padding:6px 12px 4px}
+.hdr{display:flex;gap:10px;align-items:baseline;border-bottom:2px solid var(--acc);padding-bottom:3px}
+.num{font-weight:700;color:var(--acc);font-size:1.25em;white-space:nowrap}
+.name{font-weight:700;font-size:1.12em}
+.sev{font-weight:700;padding:0 6px;border:1px solid var(--line);white-space:nowrap}
+.sev.CRITICAL{color:var(--bad);border-color:var(--bad)} .sev.HIGH{color:var(--warn);border-color:var(--warn)}
+.sev.MEDIUM{color:#e6d06a} body.light .sev.MEDIUM{color:#6b5a00} .sev.LOW{color:var(--mut)}
+.meta{margin:3px 0;display:flex;flex-wrap:wrap;gap:2px 16px}
+.k{color:var(--mut)} .v{font-weight:600} .hi{color:var(--warn)} .bad{color:var(--bad)} .ok{color:var(--ok)}
+.desc{margin:2px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:8px;margin:4px 0}
+.box{border:1px solid var(--line);background:var(--panel);padding:3px 7px;min-width:0}
+.bt{color:var(--acc);font-weight:700;font-size:.9em;letter-spacing:.04em}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 12px}
+.line{margin:1px 0}
+.grid .line,.tagl .line{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wrap{white-space:normal}
+table{border-collapse:collapse;width:100%;margin-top:3px}
+th,td{border:1px solid var(--line);padding:0 4px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:21em}
+th{color:var(--acc);font-weight:700;background:var(--panel)}
+tr.closed td{color:var(--mut)}
+.foot{color:var(--mut);font-size:.8em;margin-top:3px;display:flex;justify-content:space-between;gap:12px}
+input{font:inherit;width:5em;background:var(--panel);color:var(--fg);border:1px solid var(--line)}
+.tagl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px}
+</style></head><body>
+<div id="app"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+var D=JSON.parse(document.getElementById('data').textContent),C=D.cards,M=D.meta;
+var i=0,view='card',sel=0,ipage=0,manual=false,fs=15,PER=30;
+var SEV={CRITICAL:'CRIT',HIGH:'HIGH',MEDIUM:'MED',LOW:'LOW',INFORMATIONAL:'INFO'};
+var app=document.getElementById('app');
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function kv(k,v,cls){return '<span><span class="k">'+esc(k)+'</span> <span class="v '+(cls||'')+'">'+esc(v==null||v===''?'-':v)+'</span></span>'}
+function top(list,withPct){if(!list||!list.length)return '-';return list.map(function(x){return esc(x[0])+' '+x[1]+(withPct&&x[2]!=null?' ('+x[2]+'%)':'')}).join(' · ')}
+function line(label,html,wrap){return '<div class="line'+(wrap?' wrap':'')+'"><span class="k">'+esc(label)+'</span> '+html+'</div>'}
+function head(c,extra){return '<div class="hdr"><span class="num">CARD '+c.n+'/'+C.length+(extra?' '+extra:'')+'</span><span class="sev '+esc(c.sev)+'">'+esc(c.sev||'-')+'</span><span class="name">'+esc(c.name)+'</span></div>'}
+function foot(keys){return '<div class="foot"><span>'+esc(M.org)+' · '+esc(M.generated)+' · severity: '+esc(M.scope)+' · history '+M.history_days+'d · '+(M.masked?'identifiers masked':'UNMASKED')+' · v'+esc(M.version)+'</span><span>'+keys+'</span></div>'}
+function flags(c){var f=c.flags,o=[];if(f.ccr)o.push('config-rule finding');if(f.vuln)o.push('vulnerability');if(f.data)o.push('sensitive data');if(f.exposure)o.push('exposure');if(f.perms)o.push('permissions');if(f.tags)o.push('tags');return o.join(', ')||'properties only'}
+function card(c){
+  var s=c.stats,d=c.dist,LMAX=11,h=head(c);
+  h+='<div class="meta">'+[kv('sheet row',c.row),kv('class',c.cls),kv('enabled',c.enabled),kv('origin',c.origin),kv('BI scope',c.bi),kv('project scope',c.pscope),kv('fix at',c.fixs,'hi'),kv('conditions',flags(c)),kv('id',c.cid)].join('')+'</div>';
+  if(c.desc)h+='<div class="desc"><span class="k">what it flags:</span> '+esc(c.desc)+'</div>';
+  if(c.refs||c.srcrule)h+='<div class="line"><span class="k">config rule(s):</span> <span class="v">'+esc(c.srcrule||c.refs)+'</span></div>';
+  var more=c.logic.length>LMAX?c.logic.length-LMAX:0;
+  h+='<div class="cols"><div class="box"><div class="bt">LOGIC'+(more?'  (+'+more+' more lines: press L)':'')+'</div><pre>'+esc(c.logic.slice(0,LMAX).join('\n'))+'</pre></div>';
+  h+='<div class="box"><div class="bt">ISSUES</div><div class="grid">'+[
+    kv('open',s.open),kv('in progress',s.inprog),kv('entities',s.entities),
+    kv('critical',s.crit,s.crit?'bad':''),kv('high',s.high,s.high?'hi':''),kv('med / low',s.med+' / '+s.low),
+    kv('oldest',s.oldest!=null?s.oldest+'d':'-'),kv('median age',s.median!=null?s.median+'d':'-'),kv('past due',s.pastdue,s.pastdue?'hi':''),
+    kv('with ticket',s.ticketpct!=null?s.ticketpct+'%':'-'),kv('new 90d',s.new90),kv('accounts',s.subs),
+    kv('resolved',s.resolved),kv('rejected',s.rejected),kv('reject rate',s.rejrate!=null?s.rejrate+'%':'-',s.rejrate>=25?'bad':''),
+    kv('rejected FP',s.fp,s.fp?'hi':''),kv('obj deleted',s.objdel!=null?s.objdel+'%':'-',s.objdel>=80?'hi':''),kv('median fix',s.mttr!=null?s.mttr+'d':'-')
+  ].map(function(x){return '<div class="line">'+x+'</div>'}).join('')+'</div>';
+  h+=line('ages',top(d.ages,true));
+  if(s.rejmix)h+=line('rejected as',esc(s.rejmix));
+  if(s.resmix)h+=line('resolved as',esc(s.resmix));
+  h+='</div></div>';
+  h+='<div class="box">'+line('projects',top(d.projects,true))+line('resource types',top(d.ntypes,true))+
+     line('business impact',top(d.bi,true)+' <span class="k">· entity status</span> '+top(d.estatus,true)+' <span class="k">· cloud</span> '+top(d.clouds,false))+
+     line('regions',top(d.regions,true)+' <span class="k">· accounts</span> '+top(d.accounts,false))+
+     line('tag keys',top(d.tagkeys,true)+' <span class="k">· untagged</span> '+d.untagged+(d.untaggedpct!=null?' ('+d.untaggedpct+'%)':''))+
+     line('common tags',top(d.tagkv,false))+'</div>';
+  h+=samples(c);
+  h+=foot('← → card · 1-8 issue · L logic · I index · T theme · +/- size · go <input id="go" placeholder="card #">');
+  return h}
+function samples(c){
+  if(!c.samples.length)return '<div class="line k">no Issues in the pull window</div>';
+  var h='<table><tr><th>#</th><th>issue</th><th>sev</th><th>status</th><th>age</th><th>resource name</th><th>type</th><th>project</th><th>BI</th><th>region</th><th>acct</th><th>tags</th><th>tkt</th></tr>';
+  c.samples.forEach(function(x,n){
+    var closed=x.status==='RESOLVED'||x.status==='REJECTED';
+    var st=closed?x.status.slice(0,3)+':'+(x.reason||'?'):(x.status==='IN_PROGRESS'?'IN_PROG':'OPEN')+(x.pastdue?' !due':'');
+    var tg=x.tags.slice(0,3).map(function(t){return t[0]}).join(',')+(x.ntags>3?' +'+(x.ntags-3):'');
+    h+='<tr class="'+(closed?'closed':'')+'"><td>'+(n+1)+'</td><td>'+esc(x.id)+'</td><td>'+esc(SEV[x.sev]||x.sev)+'</td><td>'+esc(st)+'</td><td>'+(x.age!=null?Math.round(x.age)+'d':'-')+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.ntype||x.etype)+'</td><td>'+esc(x.project)+'</td><td>'+esc(x.bi)+'</td><td>'+esc(x.region)+'</td><td>'+esc(x.acct)+'</td><td>'+esc(tg||'none')+'</td><td>'+(x.tickets||'-')+'</td></tr>'});
+  return h+'</table>'}
+function logic(c){return head(c,'LOGIC')+'<div class="box"><pre>'+esc(c.logic.join('\n'))+'</pre></div>'+(c.reco?'<div class="box"><div class="bt">WIZ RESOLUTION GUIDANCE</div><div class="wrap">'+esc(c.reco)+'</div></div>':'')+(c.frameworks?line('frameworks',esc(c.frameworks),true):'')+foot('Esc back · ← → card')}
+function issue(c,x,n){
+  var h=head(c,'ISSUE '+(n+1));
+  h+='<div class="cols"><div class="box"><div class="bt">ISSUE '+esc(x.id)+'</div>'+
+    line('severity',esc(x.sev))+line('status',esc(x.status)+(x.reason?' ('+esc(x.reason)+')':''))+line('created',esc(x.created)+' · age '+(x.age!=null?x.age+'d':'-'))+
+    line('status changed',esc(x.changed||'-'))+line('due',esc(x.due||'none')+(x.pastdue?' <span class="bad">PAST DUE</span>':''))+line('tickets',x.tickets||'none')+'</div>';
+  h+='<div class="box"><div class="bt">RESOURCE</div>'+line('name',esc(x.name))+line('type',esc(x.etype)+' / '+esc(x.ntype))+line('status',esc(x.estatus||'-')+' · created '+esc(x.ecreated||'-'))+
+    line('cloud',esc(x.cloud)+' · '+esc(x.region))+line('account',esc(x.acct)+' '+esc(x.sub))+line('projects',esc(x.projects)+' · BI '+esc(x.bi),true)+'</div></div>';
+  h+='<div class="box"><div class="bt">TAGS ('+x.ntags+')</div><div class="tagl">'+(x.tags.length?x.tags.map(function(t){return '<div class="line">'+esc(t[0])+' = <span class="v">'+esc(t[1])+'</span></div>'}).join(''):'<div class="k">no tags</div>')+'</div></div>';
+  h+='<div class="box"><div class="bt">CONTROL LOGIC</div><pre>'+esc(c.logic.slice(0,10).join('\n'))+'</pre></div>';
+  return h+foot('Esc back · 1-8 other issue · ← → card')}
+function index(){
+  var pages=Math.ceil(C.length/PER)||1;if(ipage>=pages)ipage=pages-1;
+  var h='<div class="hdr"><span class="num">INDEX '+(ipage+1)+'/'+pages+'</span><span class="name">'+C.length+' cards ('+esc(M.selection)+')</span></div>';
+  h+='<table><tr><th>card</th><th>row</th><th>sev</th><th>open</th><th>crit</th><th>high</th><th>rej%</th><th>FP</th><th>fix at</th><th>control</th></tr>';
+  C.slice(ipage*PER,ipage*PER+PER).forEach(function(c){var s=c.stats;
+    h+='<tr><td>'+c.n+'</td><td>'+c.row+'</td><td>'+esc(SEV[c.sev]||c.sev)+'</td><td>'+(s.open+s.inprog)+'</td><td>'+s.crit+'</td><td>'+s.high+'</td><td>'+(s.rejrate!=null?s.rejrate:'-')+'</td><td>'+s.fp+'</td><td>'+esc(c.fixs.split(' ')[0])+'</td><td style="max-width:60em">'+esc(c.name)+'</td></tr>'});
+  return h+'</table>'+foot('PgUp PgDn page · Esc back · go <input id="go" placeholder="card #">')}
+function fit(){if(manual)return;var el=document.documentElement;fs=19;el.style.setProperty('--fs',fs+'px');
+  var n=0;while((el.scrollHeight>window.innerHeight+1||el.scrollWidth>window.innerWidth+1)&&fs>10&&n++<30){fs-=0.5;el.style.setProperty('--fs',fs+'px')}}
+function render(){
+  if(!C.length){app.innerHTML='<p>No cards: no control has an open Issue in this export.</p>';return}
+  var c=C[i];
+  app.innerHTML=view==='index'?index():view==='logic'?logic(c):view==='issue'&&c.samples[sel]?issue(c,c.samples[sel],sel):card(c);
+  document.title='Card '+c.n+' - '+c.name;
+  var go=document.getElementById('go');
+  if(go)go.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter'){var n=parseInt(go.value,10);if(n>=1&&n<=C.length){i=n-1;view='card';render()}}if(e.key==='Escape')go.blur()});
+  fit();try{history.replaceState(null,'','#'+c.n)}catch(e){}}
+document.addEventListener('keydown',function(e){
+  var k=e.key;
+  if(k==='ArrowRight'){if(i<C.length-1)i++;view='card'}
+  else if(k==='ArrowLeft'){if(i>0)i--;view='card'}
+  else if(k==='Home'){i=0;view='card'} else if(k==='End'){i=C.length-1;view='card'}
+  else if(k==='l'||k==='L'){view=view==='logic'?'card':'logic'}
+  else if(k==='i'||k==='I'){view=view==='index'?'card':'index';ipage=Math.floor(i/PER)}
+  else if(k==='PageDown'&&view==='index'){ipage++} else if(k==='PageUp'&&view==='index'){if(ipage>0)ipage--}
+  else if(k==='Escape'){view='card'}
+  else if(k==='t'||k==='T'){document.body.classList.toggle('light')}
+  else if(k==='+'||k==='='){manual=true;fs+=0.5;document.documentElement.style.setProperty('--fs',fs+'px');return}
+  else if(k==='-'){manual=true;fs-=0.5;document.documentElement.style.setProperty('--fs',fs+'px');return}
+  else if(k==='0'){manual=false}
+  else if(k>='1'&&k<='8'){var n=parseInt(k,10)-1;if(C[i]&&C[i].samples[n]){sel=n;view='issue'}else return}
+  else return;
+  e.preventDefault();render()});
+window.addEventListener('resize',function(){if(!manual)fit()});
+var h0=parseInt((location.hash||'').slice(1),10);if(h0>=1&&h0<=C.length)i=h0-1;
+render();
+})();
+</script></body></html>
+"""
+
+
+def write_cards_html(path, cards_doc):
+    payload = json.dumps(cards_doc, separators=(",", ":"), ensure_ascii=False, default=str).replace("</", "<\\/")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(CARDS_HTML.replace("__DATA__", payload))
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -1907,7 +2387,9 @@ def parse_args(argv=None):
     p.add_argument("--statuses", default="OPEN,IN_PROGRESS", help="Issue statuses for the current view (default OPEN,IN_PROGRESS)")
     p.add_argument("--history-days", type=int, default=180, help="Also pull RESOLVED/REJECTED Issues whose status changed in the last N days (default 180; 0 = skip)")
     p.add_argument("--issue-types", default="TOXIC_COMBINATION,CLOUD_CONFIGURATION", help="Issue types to pull, one pull per type (default TOXIC_COMBINATION,CLOUD_CONFIGURATION)")
-    p.add_argument("--severity", default=None, help="Issue severity filter, e.g. CRITICAL,HIGH")
+    p.add_argument("--min-severity", default="LOW", type=str.upper, choices=SEVERITY_ORDER,
+                   help="Lowest Issue severity to include (default LOW, which leaves out INFORMATIONAL). Use INFORMATIONAL to include everything")
+    p.add_argument("--severity", default=None, help="Exact Issue severities to include, e.g. CRITICAL,HIGH (overrides --min-severity)")
     p.add_argument("--project", default=None, help="Wiz project id(s) to restrict Issues to (comma-separated)")
     p.add_argument("--exclude-config-controls", action="store_true", help="Leave out config rules acting as controls (type CLOUD_CONFIGURATION) and their Issues")
     p.add_argument("--include-config-controls", action="store_true", help=argparse.SUPPRESS)  # default since 1.1.0
@@ -1916,6 +2398,10 @@ def parse_args(argv=None):
     p.add_argument("--with-issues-only", action="store_true", help="Only controls with at least one Issue in the pull window")
     p.add_argument("--sample-per-control", type=int, default=0, help="Write at most N Issues per control to the Issues sheet (0 = all)")
     p.add_argument("--no-ccr-resolve", action="store_true", help="Do not pull cloudConfigurationRules to resolve CCR ids referenced by control queries")
+    p.add_argument("--no-cards", action="store_true", help="Do not write the <output>_cards.html triage cards")
+    p.add_argument("--cards-top", type=int, default=0, help="Only write cards for the top N controls by open Issues (0 = every control with open Issues)")
+    p.add_argument("--cards-all", action="store_true", help="Also write cards for controls with no open Issues")
+    p.add_argument("--cards-unmasked", action="store_true", help="Show real account ids and resource names on the cards (default: masked)")
     p.add_argument("--app-url", default=os.environ.get("WIZ_APP_URL", DEFAULT_APP_URL), help="Console base URL for deep links (default %s)" % DEFAULT_APP_URL)
     p.add_argument("--org", default="[ORG]", help="Organisation name used in triage column headers (default [ORG])")
     p.add_argument("--page-size", type=int, default=500)
@@ -1930,7 +2416,16 @@ def parse_args(argv=None):
     args.issue_types = csv_list(args.issue_types)
     if args.exclude_config_controls:
         args.issue_types = [t for t in args.issue_types if t != "CLOUD_CONFIGURATION"] or ["TOXIC_COMBINATION"]
-    args.severity = csv_list(args.severity) if args.severity else None
+    if args.severity:
+        args.severity = [v.upper() for v in csv_list(args.severity)]
+        args.excluded_severities = [v for v in SEVERITY_ORDER if v not in args.severity]
+        args.severity_scope = "%s only (--severity)" % ", ".join(args.severity)
+    else:
+        idx = SEVERITY_ORDER.index(args.min_severity)
+        args.severity = SEVERITY_ORDER[idx:] if idx > 0 else None
+        args.excluded_severities = SEVERITY_ORDER[:idx]
+        args.severity_scope = ("%s and above (%s left out)" % (args.min_severity, ", ".join(args.excluded_severities))
+                               if idx > 0 else "all severities")
     args.project = csv_list(args.project) if args.project else None
     return args
 
@@ -1969,10 +2464,14 @@ def main(argv=None):
             log.info("controls totalCount = %s", total_c)
             grand = 0
             for itype in args.issue_types:
-                flts = [("current", {"type": [itype], "status": args.statuses})]
+                cur = issue_base_filter(args, itype)
+                cur["status"] = args.statuses
+                flts = [("current", cur)]
                 if args.history_days:
-                    flts.append(("history", {"type": [itype], "status": ["RESOLVED", "REJECTED"],
-                                             "statusChangedAt": {"after": iso_z(as_of - timedelta(days=args.history_days))}}))
+                    hist = issue_base_filter(args, itype)
+                    hist["status"] = ["RESOLVED", "REJECTED"]
+                    hist["statusChangedAt"] = {"after": iso_z(as_of - timedelta(days=args.history_days))}
+                    flts.append(("history", hist))
                 for label, flt in flts:
                     try:
                         _, total_i, _ = paged_fetch(client, "issuesV2", OrderedDict([("id", None)]), 1, "issues(count %s %s)" % (label, itype),
@@ -1984,6 +2483,9 @@ def main(argv=None):
                         continue
                     grand += total_i or 0
                     log.info("issuesV2 %s totalCount = %s", json.dumps(flt), total_i)
+            log.info("Severity scope: %s", args.severity_scope)
+            for itype, ex in count_excluded(client, args).items():
+                log.info("Left out by the severity floor: %s open %s Issues (%s)", ex["totalCount"], itype, ", ".join(args.excluded_severities))
             log.info("Estimated full run: %d Issues, ~%d issue pages + ~%d control pages", grand,
                      (grand // args.page_size) + len(args.issue_types) * 2, ((total_c or 0) // args.page_size) + 1)
             if grand > args.max_issue_rows:
@@ -2106,8 +2608,19 @@ def main(argv=None):
                     "duration": round(time.time() - started, 1)}
         out = args.output or "Wiz_Graph_Control_Triage_%s.xlsx" % as_of.strftime("%Y-%m-%d")
         analysis = build_analysis(selected, per, analyses)
+        left_out = ((evidence.get("issues") or {}).get("excluded") or {})
+        scope_line = "Severity scope: %s." % args.severity_scope
+        if left_out:
+            scope_line += " Open Issues left out: " + ", ".join("%s %s" % (e["totalCount"], t) for t, e in left_out.items()) + "."
+        analysis["headlines"].insert(0, scope_line)
         write_workbook(out, control_rows, issue_rows, input_rows, evidence, args, run_info, list_counts, analysis)
         log.info("Workbook written: %s (%d control rows, %d issue rows, %d input rows)", out, len(control_rows), len(issue_rows), len(input_rows))
+        if not args.no_cards:
+            cards_path = os.path.splitext(out)[0] + "_cards.html"
+            cards_doc = build_cards(control_rows, selected, per, analyses, args, run_info)
+            write_cards_html(cards_path, cards_doc)
+            log.info("Triage cards written: %s (%d cards, identifiers %s). Open it in a browser, press F11, one card per screen.",
+                     cards_path, len(cards_doc["cards"]), "masked" if cards_doc["meta"]["masked"] else "UNMASKED")
         log.info("---- Headlines (also on the Analysis sheet) ----")
         for h in analysis["headlines"]:
             log.info("  %s", h)
@@ -2136,7 +2649,6 @@ def main(argv=None):
     except KeyboardInterrupt:
         log.error("Interrupted")
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
